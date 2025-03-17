@@ -1,0 +1,712 @@
+USE WAREHOUSE ADHOC__XLARGE;
+CREATE OR REPLACE TABLE  PERSONAL_OKASPERSKA.public.EV_EOM AS
+(
+WITH macro_variables as 
+(
+SELECT
+    '2024-11-01'::DATE AS start_dte,
+    '2024-11-30'::DATE AS end_dte
+),
+
+                        ORDER_LIST_1 AS --- orders that still had a balance in previous month - this list will be reduced downstream using written off condition
+                        
+                        (
+                        select	B.order_id  order_id, B.consumer_id
+                        from	(select	A.ORDER_ID,
+                                        c.consumer_id,
+                            			sum((Case when A.EVENT_TYPE in ('INVOICED', 'OVERAGE') then A.amount_invoiced else NULL end))  INVOICED_AMT,
+                            			sum((Case when A.EVENT_TYPE in ('PAYMENT') then A.amount_paid else NULL end))  PAID_AMT,
+                            			sum((Case when (A.EVENT_TYPE in ('REFUNDED') and d.REFUND_TYPE in ('InterestAccrual')) then A.amount_refunded_before_payment else NULL end))  ACCRUAL_AMT,
+                                        sum((Case when (A.EVENT_TYPE in ('REFUNDED') and d.REFUND_TYPE not in ('InterestAccrual')) then A.amount_refunded_before_payment else NULL end))  REFUND_AMT,
+                            			sum((Case when A.EVENT_TYPE in ('DISCOUNT') then A.amount_paid else NULL end))  DISCOUNT_AMT
+                            		from	AP_RAW_GREEN.green.F_INSTALMENT_EVENTS	A
+                            			join	AP_RAW_GREEN.green.F_INSTALMENT	B
+                            			  on 	(A.PAR_REGION = B.PAR_REGION and A.instalment_id = B.id)
+                            			join	AP_RAW_GREEN.green.F_ORDER	C
+                            			  on 	(A.ORDER_ID = C.id and A.PAR_REGION = C.PAR_REGION)
+                                        left join AP_RAW_GREEN.green.f_refund D
+                                         on (A.PAR_REGION = D.PAR_REGION and A.refund_id = D.id)
+                            		where A.event_date between '2022-10-01' and  (select start_dte - 1 from macro_variables) -- important to look at the EOB of last day of previous month
+                            		 and C.country_code = 'US'
+                            		 and C.PAYMENT_TYPE = 'PCL'  
+                            		 and (A.EVENT_TYPE in ('INVOICED', 'OVERAGE')
+                            		 or A.EVENT_TYPE in ('PAYMENT')
+                            		 or A.EVENT_TYPE in ('REFUNDED')
+                            		 or A.EVENT_TYPE in ('DISCOUNT'))
+                                     group by 1,2
+                            		)	B
+                        where	(COALESCE(B.INVOICED_AMT, 0) - COALESCE(B.PAID_AMT, 0) - COALESCE(B.REFUND_AMT, 0) - COALESCE(B.DISCOUNT_AMT, 0) +COALESCE(B.ACCRUAL_AMT, 0)) > 0.0
+                        
+                        ),
+
+                        ORDER_LIST_2 AS --- new orders
+                        
+                        (
+                        select	id order_id, consumer_id
+                        from	AP_RAW_GREEN.green.F_ORDER	
+                        where   order_date between (select start_dte from macro_variables) and (select end_dte from macro_variables)	          		
+                        and     country_code = 'US'
+                        and     payment_type = 'PCL' 
+                        and     order_transaction_status = 'Approved'
+                            		 
+                        
+                        ),
+                        
+                        WRITTEN_OFF_DATES AS -- dates when an order was written off based on 180DO rule
+                        (
+                        select a.id order_id,
+                        b.event_date wo_date,
+                        sum(b.amount_written_off) wo_amt
+                        from AP_RAW_GREEN.GREEN.F_WRITE_OFF_EVENTS b
+                        join ap_raw_green.green.f_order a
+                        on a.id = b.order_id
+                        where b.event_type = 'Write Off'
+                        and b.write_off_event_source in ('Payment','Late Fee')
+                        and a.country_code = 'US'
+                        and a.payment_type = 'PCL'
+                        and b.event_date between '2022-10-01' and (select end_dte from macro_variables)
+                        group by 1,2
+                        ),
+
+                                ACC_CLOSED_DATES_STG AS -- dates when a consumer account was closed with balance due to bankruptcy, ATO etc
+                                (
+                                select a.consumer_id, b.uuid consumer_uuid, max(a.created_date) closed_date, max(a.created_datetime) closed_datetime
+                                from ap_raw_green.green.f_consumer_note a
+                                join ap_raw_green.green.d_consumer b
+                                on a.consumer_id = b.id
+                                where 1=1 
+                                and b.country_code = 'US'
+                                and ((note LIKE '%to ''CLOSED''%' AND note LIKE '%Status changed from%') or note like '%Account closed/disabled%')
+                                and a.created_date between '2022-10-01' and (select end_dte from macro_variables)
+                                group by 1,2
+                                ),
+        
+                                ACC_REINSTATED_DATES AS -- limited cases when an account gets reinstated when disputed liability is withdrawn
+                                (
+                                select a.consumer_id, b.uuid consumer_uuid, max(a.created_datetime) reinst_datetime
+                                from ap_raw_green.green.f_consumer_note a
+                                join ap_raw_green.green.d_consumer b
+                                on a.consumer_id = b.id
+                                where 1=1 
+                                and b.country_code = 'US'
+                               and ((note LIKE '%to ''REGISTERED''%' AND note LIKE '%Status changed from%') or (note LIKE '%to REGISTERED%' AND note LIKE '%Status Change from%'))
+                                and a.created_date between '2022-10-01' and (select end_dte from macro_variables)
+                                group by 1,2
+                                ),
+
+                        ACC_CLOSED_DATES AS
+                        (
+                        select a.consumer_id, a.consumer_uuid, a.closed_date
+                        from ACC_CLOSED_DATES_STG a
+                        left join ACC_REINSTATED_DATES b
+                        on a.consumer_id = b.consumer_id
+                        WHERE b.reinst_datetime is null or b.reinst_datetime < a.closed_datetime
+                        ),
+
+                        MAPPING AS -- to get loan id from loanservice
+                        (
+                        select loan_details_loan_id, order_transaction_id, token, origination_state, 
+                        from
+                                    (select loan_details_loan_id, order_transaction_id, token,  consumer_account_contact_address_state origination_state,
+                                    row_number () over (partition by order_transaction_id order by event_info_event_time desc) as rnk
+                                    from AP_RAW_GREEN.green.RAW_C_E_ORDER
+                                    where payment_type = 'PCL'
+                                    
+                                    and status = 'APPROVED')  
+                        where rnk =1
+                        ),
+                        
+                        UNIONED_BASE As -- to get one list of order for further assessment
+                        (
+                        Select distinct (order_id), max(consumer_id) consumer_id
+                        from 
+                                (
+                                    (select 
+                                    order_id,
+                                    consumer_id
+                                    from order_list_1)
+            
+                                    UNION
+                                    
+                                    (select 
+                                    order_id,
+                                    consumer_id
+                                    from order_list_2)
+                                )
+                        group by 1        
+                        ),
+
+
+
+                PRE_BASE AS
+                (
+                select 
+                a.order_id,
+                a.consumer_id,
+                c.uuid consumer_uuid,
+                d.token,
+                d.loan_details_loan_id,
+                c.postcode,
+                c.state current_state,
+                b.wo_date written_off_date,
+                e.closed_date acc_closed_date,
+                case when (e.closed_date <= b.wo_date and e.closed_date is not null and b.wo_date is not null) then e.closed_date 
+                     when (e.closed_date >  b.wo_date and e.closed_date is not null and b.wo_date is not null) then b.wo_date
+                     when (e.closed_date is not null and b.wo_date is null) then e.closed_date
+                     when (e.closed_date is null and b.wo_date is not null) then b.wo_date
+                     else null end as wo_date, -- whichever came sooner - account written off or closed - either way we will exclude these from reporting
+                case when (c.marketing_email_subscribed = 0 or c.marketing_push_subscribed = 0) then 'Y' else 'N' end as DNC_Flag
+                from unioned_base a
+                join ap_raw_green.green.d_consumer c
+                on a.consumer_id = c.id
+                left join written_off_dates b
+                on a.order_id = b.order_id 
+                join mapping d
+                on a.order_id = d.order_transaction_id
+                left join acc_closed_dates e
+                on a.consumer_id = e.consumer_id
+                --where b.wo_date >= (select start_dte from macro_variables) --excludes previously written off orders
+                ),
+
+BASE AS
+(
+select * from PRE_BASE 
+where 1=1
+and wo_date >= (select start_dte from macro_variables) or wo_date is null
+), 
+
+SCRA as
+(
+select
+a.ORDER_ID,
+a.created_date SCRA_APPLIED_DATE
+from ap_raw_green.green.F_ORDER_TRANSACTION_NOTE a
+WHERE a.note like '%SCRA Status%'
+and created_date between '2022-10-01' and (select end_dte from macro_variables)
+),
+
+ADDRESS_CHANGE as -- potentially to be replaced with different table - a defect under investigaton by the identity team
+(
+select consumer_uuid, change_date
+from (
+        SELECT b.uuid consumer_uuid, a.created_date change_date,
+        row_number() over ( partition by a.consumer_id order by a.created_datetime desc) as rnk
+        from ap_raw_green.green.f_consumer_note a
+        join ap_raw_green.green.d_consumer b
+        on a.consumer_id = b.id
+        where 1=1
+        and note like '%Original address details before update%'
+    )
+where  rnk = 1
+and change_date between (select start_dte from macro_variables) and (select end_dte from macro_variables)
+),
+
+APR as
+ (
+ with loan_details AS
+            (
+            select * from 
+                    (
+                    select
+                    distinct KEY_LOAN_ID,
+                    EFFECTIVE_APR,
+                    ORIGINATION_DATE,
+                    ORIGINATED_PRINCIPAL,
+                    rank() over (partition by key_loan_id order by event_info_event_time desc) as rnk
+                    FROM AP_RAW_GREEN.green.raw_c_e_loanservice_loan
+                    WHERE status = 'IN_PROGRESS'
+                    AND start_date IS NOT NULL
+                    AND ORIGINATION_DATE between '2022-10-01' and (select end_dte from macro_variables)
+                    )
+            where rnk = 1
+            
+            UNION
+            
+            (select * from  
+                    (
+                    select distinct KEY_LOAN_ID,
+                    EFFECTIVE_APR,
+                    ORIGINATION_DATE,
+                    ORIGINATED_PRINCIPAL,
+                    rank() over (partition by key_loan_id order by event_info_event_time desc) as rnk
+                    FROM AP_RAW_GREEN.green.raw_c_e_loanservice_loan
+                    WHERE EXTERNAL_REF NOT IN
+                            (
+                            SELECT
+                            DISTINCT EXTERNAL_REF
+                            FROM AP_RAW_GREEN.green.raw_c_e_loanservice_loan
+                            WHERE status = 'IN_PROGRESS'
+                            AND start_date IS NOT NULL
+                            )
+                    AND status = 'CLOSED'
+                    AND start_date IS NOT NULL
+                    AND origination_date between '2022-10-01' and (select end_dte from macro_variables)
+                    )
+            where RNK = 1)
+            
+            )
+            
+SELECT key_loan_id, effective_APR
+FROM loan_details
+),
+
+CLOSED_LOANS as --loan is voluntarily closed when paid off
+(
+SELECT key_loan_id, close_date, status_closed,
+    FROM (
+    select distinct key_loan_id,
+    status AS status_closed,
+    to_date(convert_timezone('UTC', 'America/Los_Angeles',to_timestamp(event_info_event_time))) AS CLOSE_DATE,
+    rank() over (partition by key_loan_id order by event_info_event_time desc) as rank
+    FROM AP_RAW_GREEN.green.raw_c_e_loanservice_loan
+    WHERE status = 'CLOSED'
+    AND CLOSE_DATE IS NOT NULL
+    ) b
+WHERE b.RANK = 1 
+AND CLOSE_DATE between (select start_dte from macro_variables) and (select end_dte from macro_variables)
+),
+
+
+        BALANCE_COMPONENTS AS
+        
+        (
+        select	
+        A.order_id,
+        c.id instalment_id,
+        c.current_due_date,
+        sum((Case when A.EVENT_TYPE in ('INVOICED', 'OVERAGE') then A.amount_invoiced else NULL end))  INVOICED_AMT,
+        sum((Case when A.EVENT_TYPE in ('PAYMENT') then A.amount_paid else NULL end))  PAID_AMT,
+       sum((Case when (A.EVENT_TYPE in ('REFUNDED') and d.REFUND_TYPE in ('InterestAccrual')) then A.amount_refunded_before_payment else NULL end))  ACCRUAL_AMT,
+        sum((Case when (A.EVENT_TYPE in ('REFUNDED') and d.REFUND_TYPE not in ('InterestAccrual')) then A.amount_refunded_before_payment else NULL end))  REFUND_AMT,
+        sum((Case when A.EVENT_TYPE in ('DISCOUNT') then A.amount_paid else NULL end))  DISCOUNT_AMT
+        from AP_RAW_GREEN.green.F_INSTALMENT_EVENTS	A
+        join	base	B
+        on 	A.ORDER_ID = B.order_id 
+        left join ap_raw_green.green.f_instalment C
+        on A.gdp_region = C.gdp_region and  A.instalment_id = C.id
+        left join AP_RAW_GREEN.green.f_refund D
+        on (A.PAR_REGION = D.PAR_REGION and A.refund_id = D.id)
+        where	1=1
+        and A.event_date between '2022-10-01' and (select end_dte from macro_variables)
+               and (A.EVENT_TYPE in ('INVOICED', 'OVERAGE')
+        	 or A.EVENT_TYPE in ('PAYMENT')
+        	 or A.EVENT_TYPE in ('REFUNDED')
+        	 or A.EVENT_TYPE in ('DISCOUNT'))
+        group by	1,2,3
+        ),
+        
+        BALANCE_INTERMEDIATE AS
+        (
+        SELECT order_id, 
+        sum(INVOICED_AMT) INVOICED_AMT,
+        sum(PAID_AMT) PAID_AMT,
+        sum (ACCRUAL_AMT) ACCRUAL_AMT,
+        sum(REFUND_AMT) REFUND_AMT,
+        sum(DISCOUNT_AMT) DISCOUNT_AMT
+       FROM BALANCE_COMPONENTS 
+       group by 1
+        ),
+
+        ORDER_BALANCE AS
+        (SELECT order_id,
+        ((COALESCE(INVOICED_AMT, 0) - COALESCE(PAID_AMT, 0) - COALESCE(REFUND_AMT, 0) - COALESCE(DISCOUNT_AMT, 0) + COALESCE(ACCRUAL_AMT, 0))) balance_amt
+        FROM BALANCE_INTERMEDIATE 
+        ),
+        
+        INSTALMENT_BALANCE AS
+        (SELECT order_id, instalment_id, current_due_date,
+        ((COALESCE(INVOICED_AMT, 0) - COALESCE(PAID_AMT, 0) - COALESCE(REFUND_AMT, 0) - COALESCE(DISCOUNT_AMT, 0) + COALESCE(ACCRUAL_AMT, 0))) inst_balance_amt
+        FROM BALANCE_COMPONENTS
+        ),
+
+BALANCE_CYCLE_END AS -- cycle end is the date of a repayment
+
+ (       with CYCLE_DATE as
+         (   
+         select a.order_id, max (b.current_due_date) cycle_end_date
+         from base a
+         left join ap_raw_green.green.f_instalment b
+         on a.order_id = b.order_id
+         where b.current_due_date <= (select end_dte from macro_variables)
+         group by 1
+         ),
+ 
+
+        BALANCE_CYCLE_INTERMEDIATE as
+        
+        (
+        select	
+        A.order_id,
+        sum((Case when A.EVENT_TYPE in ('INVOICED', 'OVERAGE') then A.amount_invoiced else NULL end))  INVOICED_AMT,
+        sum((Case when A.EVENT_TYPE in ('PAYMENT') then A.amount_paid else NULL end))  PAID_AMT,
+        sum((Case when (A.EVENT_TYPE in ('REFUNDED') and d.REFUND_TYPE in ('InterestAccrual')) then A.amount_refunded_before_payment else NULL end))  ACCRUAL_AMT,
+        sum((Case when (A.EVENT_TYPE in ('REFUNDED') and d.REFUND_TYPE not in ('InterestAccrual')) then A.amount_refunded_before_payment else NULL end))  REFUND_AMT,
+        sum((Case when A.EVENT_TYPE in ('DISCOUNT') then A.amount_paid else NULL end))  DISCOUNT_AMT
+        from AP_RAW_GREEN.green.F_INSTALMENT_EVENTS	A
+        join	base	B
+        on 	A.ORDER_ID = B.order_id 
+        left join ap_raw_green.green.f_instalment C
+        on A.gdp_region = C.gdp_region and  A.instalment_id = C.id
+        left join AP_RAW_GREEN.green.f_refund D
+        on (A.PAR_REGION = D.PAR_REGION and A.refund_id = D.id)
+        left join CYCLE_DATE E
+        on b.order_id = e.order_id
+        where	1=1
+        and A.event_date between '2022-10-01' and e.cycle_end_date
+            and (A.EVENT_TYPE in ('INVOICED', 'OVERAGE')
+        	or A.EVENT_TYPE in ('PAYMENT')
+        	or A.EVENT_TYPE in ('REFUNDED')
+        	or A.EVENT_TYPE in ('DISCOUNT'))
+        group by	1
+        )
+        
+
+
+SELECT order_id,
+((COALESCE(INVOICED_AMT, 0) - COALESCE(PAID_AMT, 0) - COALESCE(REFUND_AMT, 0) - COALESCE(DISCOUNT_AMT, 0) + COALESCE(ACCRUAL_AMT, 0))) balance_cycle_end_amt
+FROM BALANCE_CYCLE_INTERMEDIATE
+
+),             
+
+FIRST_DELINQ as
+(
+select order_id,
+min(current_due_date) as Date_of_First_Delinquency,
+max((select end_dte from macro_variables) - current_due_date) as number_of_days_past_due
+from INSTALMENT_BALANCE
+WHERE INST_BALANCE_AMT >0 
+and current_due_date <= (select end_dte from macro_variables)
+group by 1
+),
+
+
+
+MONTHLY_PAYMENT_DUE as
+(
+select	order_id, 
+coalesce ( sum(invoiced_amt),0) + coalesce(sum(ACCRUAL_AMT),0) as amount_due				
+from balance_components
+where current_due_date between (select start_dte from macro_variables) and (select end_dte from macro_variables)						
+group by	1	
+),
+
+AUTOPAY as
+(
+                                WITH AUTOPAY_AT_ORDER AS 
+                                            (---- to get the status as at order
+                                            WITH First_event_type_temp AS 
+                                            (
+                                            SELECT A.order_id, 
+                                            case when A.note like '%toggled Autopay off%' then 'Toggle Off' 
+                                            	when A.note like '%Autopay enabled' then 'Toggle On' 
+                                            	WHEN a.note = 'Consumer Autopay disabled' then 'Toggle Off' 
+                                            	WHEN a.note = 'Consumer Autopay enabled' then 'Toggle On' 
+                                            	else NULL END first_event_type,
+                                            row_number() over (partition by order_id order by created_datetime asc) RNK,
+                                            A.created_datetime
+                                            FROM AP_RAW_GREEN.GREEN.F_ORDER_TRANSACTION_NOTE A 
+                                            JOIN AP_RAW_GREEN.GREEN.F_ORDER B
+                                            ON A.ORDER_ID = B.id
+                                            AND B.order_datetime between '2022-10-18' and (select end_dte from macro_variables) --autopay flag was introduced on 17 Oct 2022; second date aligns with cut off
+                                            AND B.PAYMENT_TYPE = 'PCL'
+                                            WHERE first_event_type IN ('Toggle On', 'Toggle Off')
+                                            ),
+                                            
+                                            First_event_type AS 
+                                            (
+                                            SELECT D.order_id order_id, 
+                                            D.first_event_type,
+                                            D.created_datetime first_change_datetime
+                                            FROM First_event_type_temp D	
+                                            WHERE D.RNK =1
+                                            ),
+                                            
+                                            State_at_checkout AS 
+                                            (
+                                            SELECT B.id ORDER_id, 
+                                            B.payment_type,
+                                            F.FIRST_EVENT_TYPE FIRST_EVENT_TYPE,
+                                            B.order_datetime,
+                                            B.order_date,
+                                            F.first_change_datetime,
+                                            CASE WHEN F.FIRST_EVENT_TYPE = 'Toggle On' THEN 1 WHEN F.FIRST_EVENT_TYPE = 'Toggle Off' THEN 0 ELSE B.autopay_disabled END as autpay_disabled_at_checkout_flag
+                                            FROM AP_RAW_GREEN.GREEN.F_ORDER B
+                                            LEFT JOIN First_event_type F
+                                            ON B.id = F.order_id
+                                            WHERE B.ORDER_TRANSACTION_STATUS = 'Approved'
+                                            AND B.order_datetime between '2022-10-18' and '2024-07-31' -- autopay flag was introduced on 17 Oct 2022; second date aligns with cut off
+                                            --AND B.PAYMENT_TYPE = 'PCL'
+                                            )
+                                            
+                                            SELECT 
+                                            Z.ORDER_ID,
+                                            Z.payment_type,
+                                            Z.autpay_disabled_at_checkout_flag, 
+                                            to_date(Z.order_datetime) order_date
+                                           
+                                            FROM State_at_checkout Z 
+                                ),
+                                
+                                -- to pick up the last change before the cut off date
+                                CHANGE_BEFORE_CUT_OFF AS
+                                (
+                                SELECT A.order_id, 
+                                            case when A.note like '%toggled Autopay off%' then 'Toggle Off' 
+                                            	when A.note like '%Autopay enabled' then 'Toggle On' 
+                                            	WHEN a.note = 'Consumer Autopay disabled' then 'Toggle Off' 
+                                            	WHEN a.note = 'Consumer Autopay enabled' then 'Toggle On' 
+                                            	else NULL END event_type,
+                                            row_number() over (partition by a.order_id order by a.created_datetime desc) as RNK,
+                                            A.created_datetime
+                                            FROM AP_RAW_GREEN.GREEN.F_ORDER_TRANSACTION_NOTE A 
+                                            JOIN AP_RAW_GREEN.GREEN.F_ORDER B
+                                            ON A.ORDER_ID = B.id
+                                            WHERE event_type IN ('Toggle On', 'Toggle Off')
+                                            and b.payment_type = 'PCL'
+                                            AND to_date(a.created_datetime) between '2022-10-18' and (select end_dte from macro_variables) --autopay flag was introduced on 17 Oct 2022; 
+                                            
+                                  ),
+                                
+                                  LAST_CHANGE_BEFORE_CUT_OFF AS
+                                  (
+                                  SELECT order_id,
+                                  event_type last_event_type,
+                                  created_datetime
+                                  FROM CHANGE_BEFORE_CUT_OFF
+                                  WHERE RNK = 1
+                                  ),
+                                
+                                  
+                                  CONSOLIDATED AS
+                                  (
+                                  SELECT 
+                                  A.ORDER_ID,
+                                  A.autpay_disabled_at_checkout_flag, 
+                                  A.order_date,
+                                  B.last_event_type,
+                                  b.created_datetime
+                                  FROM AUTOPAY_AT_ORDER A
+                                  LEFT JOIN LAST_CHANGE_BEFORE_CUT_OFF B
+                                  ON a.order_id = b.order_id
+                                  ),
+                                
+                                  ---- if no changes before the cut off date, use status from order time
+                                CLEANED_UP AS
+                                (
+                                SELECT 
+                                order_id,
+                                order_date,
+                                CASE WHEN last_event_type is not null then last_event_type else autpay_disabled_at_checkout_flag END AS autopay_at_cutoff
+                                FROM CONSOLIDATED 
+                                )
+
+
+SELECT order_id,
+case when autopay_at_cutoff in ('true','Toggle Off') then 'autopay_disabled' 
+when autopay_at_cutoff in ('false','Toggle On') then 'autopay_enabled' 
+else null end as autopay_at_cutoff
+from CLEANED_UP 
+
+),
+
+ACCRUED_INTEREST as
+
+(
+            with interest_base as           
+            (
+            select
+            b.order_id,
+            a.key_loan_id,
+            to_date(convert_timezone('UTC', 'America/Los_Angeles',a.event_info_event_time)) date_pst,
+            a.accrued_interest_amount,
+            a.single_day_interest_amount,
+            row_number() over (partition by key_loan_id order by (convert_timezone('UTC', 'America/Los_Angeles',to_timestamp(a.event_info_event_time))) asc) rnk
+            from AP_RAW_GREEN.GREEN.RAW_C_E_LOANSERVICE_DAILY_ACCRUAL a
+            join base b
+            on a.key_loan_id = b.loan_details_loan_id
+            where 1=1
+            and date_pst between (select start_dte from macro_variables) and (select end_dte from macro_variables)
+            and a.gdp_region = 'US'       
+            ),
+            
+            first_day_interest as
+            (
+            select order_id,
+            coalesce(ACCRUED_INTEREST_AMOUNT,0) - coalesce(SINGLE_DAY_INTEREST_AMOUNT,0) first_day_amt
+            from interest_base
+            where rnk = 1         
+            ),
+            
+            accrued as
+            (
+            select order_id,
+            sum(SINGLE_DAY_INTEREST_AMOUNT) accrued_amt
+            from interest_base
+            where SINGLE_DAY_INTEREST_AMOUNT >0
+            group by 1
+            )
+
+
+SELECT a.order_id,
+coalesce(a.first_day_amt,0)+coalesce(b.accrued_amt,0) accrued_interest_amt
+from first_day_interest a
+join accrued b
+on a.order_id = b.order_id
+),
+
+PAYMENTS as
+(
+select	a.order_id,				
+	sum(a.amount_paid)  total_paid_amt				
+from AP_RAW_GREEN.green.F_INSTALMENT_EVENTS	a
+join BASE b
+on a.order_id = b.order_id
+where a.event_date between (select start_dte from macro_variables) and (select end_dte from macro_variables)				
+and a.EVENT_TYPE in ('PAYMENT')					
+group by	1			
+),
+
+CEASE_AND_DESIST as -- methodology advised by CS and Operations DS teams
+(
+SELECT
+a.uuid consumer_uuid,
+a.created_date_local REQUEST_DATE
+FROM (
+         SELECT
+             key_ticket_id
+           , key_tag
+          , rk
+           , ROW_NUMBER() OVER (PARTITION BY key_ticket_id,key_tag ORDER BY rk DESC) AS rank_n
+         FROM (
+                  SELECT
+                      key_ticket_id
+                    , key_tag
+                    , 1 AS rk
+                  FROM ap_raw_green.green.raw_o_e_zendesk_ticket_tag_vega
+                  WHERE key_tag IN ('macro_900024047643')
+                  
+                  UNION ALL
+                  
+                  SELECT
+                      key_ticket_id
+                    , key_tag
+                    , 2 AS rk
+                  FROM ap_raw_green.green.raw_o_e_zendesk_ticket_tag
+                  WHERE key_tag IN ('macro_900024047643')
+              )
+     ) b
+JOIN AP_CUR_XOOP_G.OPERATION.M_ZENDESK_TICKETS_BASE a
+ON a.zticket_id = b.key_ticket_id
+JOIN ap_raw_green.green.d_consumer d
+on a.UUID = d.uuid
+WHERE REQUEST_DATE <=(select end_dte from macro_variables)
+and b.rank_n = 1
+and d.country_code = 'US'
+
+),
+
+COMMS_DATES as -- the earliest/latest time when consumer received marketing comms from Afterpay is reuired at consumer local time, we base it on CURRENT address STATE therefore it will never be 100% accurate, FEB has been advised of the method
+(
+select a.consumer_id, 
+b.uuid consumer_uuid, 
+case when b.state = 'AZ' then min(time(convert_timezone('UTC', 'America/Phoenix',to_timestamp(sent_datetime))))
+     when b.state = 'AK' then min(time(convert_timezone('UTC', 'America/Anchorage',to_timestamp(sent_datetime))))  
+     when b.state in ('AL','AR','IL','IA','KS','KY','LA','MN','MS','MO','NE','ND','OK','SD','TN','TX','WI') then min(time(convert_timezone('UTC', 'America/Chicago',to_timestamp(sent_datetime)))) 
+     when b.state in ('CT','DE','DC','FL','GA','IN','KY','ME','MD','MA','MI','NH','NJ','NY','NC','OH','PA','RI','SC','TN','VT','VA','WV') then min(time(convert_timezone('UTC', 'America/New_York',to_timestamp(sent_datetime))))
+     when b.state in ('HI') then min(time(convert_timezone('UTC', 'HST',to_timestamp(sent_datetime))))
+     when b.state in ('CO','ID','MT','NM','SD','UT','WY') then min(time(convert_timezone('UTC', 'America/Denver',to_timestamp(sent_datetime))))
+     when b.state in ('CA','NV','OR','WA') then min(time(convert_timezone('UTC', 'America/Los_Angeles',to_timestamp(sent_datetime))))
+else min(time(convert_timezone('UTC', 'America/Los_Angeles',to_timestamp(sent_datetime)))) end as Earliest_Contact_Attempt, 
+case when b.state = 'AZ' then max(time(convert_timezone('UTC', 'America/Phoenix',to_timestamp(sent_datetime))))
+     when b.state = 'AK' then max(time(convert_timezone('UTC', 'America/Anchorage',to_timestamp(sent_datetime))))  
+     when b.state in ('AL','AR','IL','IA','KS','KY','LA','MN','MS','MO','NE','ND','OK','SD','TN','TX','WI') then max(time(convert_timezone('UTC', 'America/Chicago',to_timestamp(sent_datetime)))) 
+     when b.state in ('CT','DE','DC','FL','GA','IN','KY','ME','MD','MA','MI','NH','NJ','NY','NC','OH','PA','RI','SC','TN','VT','VA','WV') then max(time(convert_timezone('UTC', 'America/New_York',to_timestamp(sent_datetime))))
+     when b.state in ('HI') then max(time(convert_timezone('UTC', 'HST',to_timestamp(sent_datetime))))
+     when b.state in ('CO','ID','MT','NM','SD','UT','WY') then max(time(convert_timezone('UTC', 'America/Denver',to_timestamp(sent_datetime))))
+     when b.state in ('CA','NV','OR','WA') then max(time(convert_timezone('UTC', 'America/Los_Angeles',to_timestamp(sent_datetime))))
+else max(time(convert_timezone('UTC', 'America/Los_Angeles',to_timestamp(sent_datetime)))) end as Latest_Contact_Attempt,
+count(message_id) Total_Number_of_Contacts
+from AP_CUR_BI_G.CURATED_ANALYTICS_GREEN.DWM_MKTG_CRM_CAMPAIGN_EVENT a
+left join ap_raw_green.green.d_consumer b
+on a.consumer_id = b.id
+where a.country_code = 'US'
+and a.sent_flag = 1
+and to_date(convert_timezone('UTC', 'America/Los_Angeles',to_timestamp(sent_datetime))) between (select start_dte from macro_variables) and (select end_dte from macro_variables)
+group by 1,2, b.state
+)
+
+
+----- FINAL PASS
+
+SELECT 
+'Block' as Partner_ID,
+a.token as Application_ID,
+--a.order_id, -- keep commented out in case troubleshooting is needed
+a.loan_details_loan_id as Loan_Account_Number,
+a.consumer_uuid Customer_id,
+case when b.SCRA_APPLIED_DATE between (select start_dte from macro_variables) and (select end_dte from macro_variables) then 'Y' else 'N' end as Active_Duty_Flag,
+case when c.change_date is not null then 'Y' else 'N' end as Address_Change_Request_Flag,
+c.change_date as Address_Change_Date,
+case when b.SCRA_APPLIED_DATE <= (select end_dte from macro_variables) then 0 else d.effective_apr end as APR,
+'N/A' as Atty_Flag,
+a.wo_date as Charge_off_Date,
+case when a.wo_date is not null then a.wo_date else e.close_date end as Closed_Date, -- loans belonging to written off or closed account inherit that date as involutarily closed
+case when a.wo_date is not null then 'Involuntary' when e.close_date is not null then 'Voluntary' else null end as Closed_Reason,
+case when m.request_date is not null then 'Y' else 'N' end as CND_FLAG, 
+'N/A' as Credit_Reporting_Suppressed_Flag,
+'N/A' as Data_Sharing_Opt_Out_Flag, 
+case when f.number_of_days_past_due>0 then f.Date_of_First_Delinquency else null end as Date_of_First_Delinquency,
+a.DNC_Flag as  DNC_Flag,
+o.Earliest_Contact_Attempt as Earliest_Contact_Attempt, 
+'Y' as Econsent_Flag, -- as per product flow it is impossible to proceed with credt decision without E-Consent
+'E' as Language_Flag,
+o.Latest_Contact_Attempt as Latest_Contact_Attempt,
+n.balance_cycle_end_amt as Loan_Balance_at_Cycle_Date,
+g.balance_amt as Loan_Balance_at_EOM,
+h.amount_due as Minimum_Monthly_Payment_Due,
+case when f.number_of_days_past_due >0 then f.number_of_days_past_due else 0 end as Number_of_Days_Past_Due,
+'N/A' as Penalty_APR_flag,
+'N/A' as Penalty_APR_Rate,
+case when i.autopay_at_cutoff = 'autopay_enabled' then 'Y' else 'N' end as Preauthorized_EFT_Flag,
+'N/A' as Replacement_Credit_Card_Request_Flag,
+(select end_dte from macro_variables) as Report_Date, 
+'N/A' as Same_as_Cash_Code,
+a.current_state as State,
+'N/A' as TCPA_Marketing_Consent_Flag,
+o.Total_Number_of_Contacts as Total_num_contacts, ---possibly dev required
+'N/A' as Total_Fees_Assessed,
+k.accrued_interest_amt as Total_Interest_Assessed,
+l.total_paid_amt as Total_Payments,
+cast(a.postcode as varchar) as Zipcode_plus_four --we use regular zip cast as string to avoid leading 0 issues
+ 
+ from BASE a
+ left join SCRA b
+ on a.order_id = b.order_id
+ left join ADDRESS_CHANGE c
+ on a.consumer_uuid = c.consumer_uuid
+ left join APR d
+ on a.loan_details_loan_id = d.key_loan_id
+ left join CLOSED_LOANS e
+ on a.loan_details_loan_id = e.key_loan_id
+ left join FIRST_DELINQ f
+ on a.order_id = f.order_id
+ left join ORDER_BALANCE g
+ on a.order_id = g.order_id
+ left join MONTHLY_PAYMENT_DUE h
+ on a.order_id = h.order_id
+ left join AUTOPAY i
+ on a.order_id = i.order_id
+ left join ACCRUED_INTEREST k
+ on a.order_id = k.order_id
+ left join PAYMENTS l
+ on a.order_id = l.order_id
+ left join CEASE_AND_DESIST m
+ on a.consumer_uuid = m.consumer_uuid
+ left join BALANCE_CYCLE_END n
+ on a.order_id = n.order_id
+ left join COMMS_DATES o
+ on a.consumer_uuid = o.consumer_uuid
+-- where base.order_id not in (select order_id from app_cash_3pr.afterpay.test_order_exclusions)
+) 
+
+ 

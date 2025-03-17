@@ -1,0 +1,502 @@
+WITH 
+
+
+ AAN as 
+                (select *
+                from
+                    (select  
+                        consumer_uuid, 
+                        ORDER_TOKEN,
+                        BATCH_DTTM, 
+                        order_date,
+                        row_number() over (partition by consumer_uuid, order_token, decline_reason order by doc_id desc) as rnk,
+                        SPLIT_PART(DECLINE_REASON_MAPPING, ';', 1) as aan_1,
+                        SPLIT_PART(DECLINE_REASON_MAPPING, ';', 2) as aan_2,
+                        SPLIT_PART(DECLINE_REASON_MAPPING, ';', 3) as aan_3,
+                        SPLIT_PART(DECLINE_REASON_MAPPING, ';', 4) as aan_4,
+                        decline_main_sub_reason,
+                        decline_reason
+                    from ap_cur_crrskbr_g.curated_credit_risk_bureau.cl_send_aan_us_remediation_20241019
+                    )
+                where rnk = 1),    
+
+macro_variables as 
+
+(
+SELECT
+ min(order_date) AS start_dte,
+ max(order_date) AS end_dte
+FROM AAN   
+),
+
+APPLICATION_IDV as --- FEB requested to include the attempts that were declied at IDV stage. It makes most sense to pull this population first and union at the end as there is a number of fields that would not be populated or would require very complicated joins otherwise
+(
+            with BASE as
+            (
+                        select * from
+                            (select * from 
+                                (
+                                select 
+                                order_detail_order_token order_token, 
+                                consumer_consumer_uuid consumer_uuid,
+                                KEY_EVENT_INFO_ID,
+                                order_detail_consumer_total_amount_amount ,
+                                event_info_event_time,
+                                rejection_reason,
+                                order_detail_merchant_merchant_id merchant_id,
+                                result ,
+                                to_date(convert_timezone('UTC','America/Los_Angeles', event_info_event_time)) as application_date,            
+                                ROW_NUMBER () OVER(PARTITION BY  consumer_consumer_uuid, order_detail_order_token ORDER BY  EVENT_INFO_EVENT_TIME desc) as rnk
+                                from ap_raw_green.green.RAW_C_E_CL_IDV_RESULT 
+                                where par_region = 'US'
+                                order by 1,2
+                                
+                                ) 
+                                where rnk =1
+                                and to_date(convert_timezone('UTC','America/Los_Angeles',event_info_event_time)) between (select start_dte from macro_variables) and (select end_dte from macro_variables)
+                                )
+                            where result = 'FAILED'
+                ),
+                        
+            
+                     
+                DC_GREEN as
+                    (select UUID,ID, suburb, state, postcode from AP_RAW_GREEN.GREEN.d_consumer where COUNTRY_CODE = 'US'), 
+                 
+            
+                DC_RED as
+                    (select ID, given_names, surname, date_of_birth, ADDRESS1, ADDRESS2 from ap_raw_red_csmr.red.D_CONSUMER__okasperska_DSL3_SV)
+             
+                
+            -- FINAL_PASS as
+            select 'BLOCK' as Partner_ID
+                   --  , base.order_token as Application_ID
+                     , concat(base.order_token,'__',base.KEY_EVENT_INFO_ID) as Application_ID
+                     --, base.order_token
+                     , NULL as Loan_Account_Number
+                     , base.consumer_uuid as Customer_ID
+                     , dc_red.GIVEN_NAMES as First_Name
+                     , dc_red.SURNAME as Last_Name
+                     , 'WIP' as SSn_or_FedID
+                     , dc_red.DATE_OF_BIRTH as Date_of_Birth
+                     , dc_red.ADDRESS1 as Street_Address1
+                     , dc_red.ADDRESS2 as Street_Address2
+                     , dc_green.SUBURB as City
+                     , dc_green.STATE as State
+                     , cast(dc_green.POSTCODE as varchar) as Zipcode_plus_four
+                     , 'N/A' as Ability_to_Pay_Measurement_Value
+                     , 'N/A' as Ability_to_Pay_Result
+                     , NULL as Active_Duty_Flag       
+                     , (CASE WHEN base.rejection_reason = 'ADDRESS_ISSUE' then 'Y' else 'N' END) as Address_Discrepancy_Alert
+                     , aan.BATCH_DTTM as Adverse_Action_Notice_Date
+                     , aan.aan_1 as Adverse_Action_Reason_1
+                     , aan.aan_2 as Adverse_Action_Reason_2
+                     , aan.aan_3 as Adverse_Action_Reason_3
+                     , aan.aan_4 as Adverse_Action_Reason_4            
+                     , extract(year from to_date(convert_timezone('UTC','America/Los_Angeles',base.EVENT_INFO_EVENT_TIME))) - extract(year from dc_red.date_of_birth) as Applicant_age_at_time_of_application
+                     , NULL as Amount_Financed
+                     , base.application_date as Application_Date 
+                     , base.application_date as Application_Decision_Date
+                     , 'Point of Sale' as Application_Type
+                     , NULL as Approved_Loan_Amount_or_Initial_Credit_Limit
+                     , 'N/A' as Campaign_Name
+                     , 'Y' as CIP_Match_Flag
+                     , NULL as Credit_Reporting_Agency_Supplier
+                     , 'N/A' as Credit_Score_Exception_Notice_Date
+                     , NULL as Customer_eConsent_Flag
+                     , 'N/A' as Customer_Requested_Decline_Reasons_Flag
+                     , 'N/A' as Date_Customer_Requested_Decline_Reasons            
+                     , NULL as Date_of_Bureau_Inquiry
+                     , 'N/A' as Debt_to_Income_Ratio
+                     , 'APPLICATION DENIED' as  Disposition_of_Application
+                     , 'N/A' as Employment_Duration            
+                     , NULL as Fraud_Alert_Initial
+                     , NULL as Fraud_Alert_Extended            
+                     , 'N/A' as Income_of_Applicant
+                     , 'N/A' as Income_of_Joint_or_Co_Applicant
+                     ,'Fixed' as Interest_Rate_Method
+                     , 'N/A' as Name_of_Joint_or_Co_Applicant
+                     , 'English' Language_Flag            
+                     , NULL as Loan_Acceptance_Date
+                     , 'N/A' as Marketing_Channel
+                     ,  merch.trading_name as Merchant
+                     , 'N/A' as MLA_Status
+                     , 'N/A' as MLA_Status_Indicator_Method            
+                     , 'N/A' as Non_CRA_third_party_reason_for_decline
+                     , 'N/A' Non_CRA_third_party_reason_for_decline2            
+                     , (CASE WHEN base.rejection_reason = 'OFAC_ISSUE' then 'Y' else 'N' end) as OFAC_Soft_Hit
+                     , base.application_date as OFAC_Check_Date            
+                     , 'N' as Firm_Offer_of_Credit
+                     , 'N/A' as Origination_Fee
+                     , NULL as Payment_Amount  
+                     , 'Monthly' as Payment_Frequency
+                     , 'N/A' as Payment_to_Income_Ratio            
+                     , 'N/A' as Pend_Reason
+                     , 'N' as POC_Flag
+                     , 'Apinstallment' as Product
+                     , 'N/A' as Promotional_Interest_Rate
+                     , 'N/A' as Promotional_Interest_Rate_Duration
+                     , 'N/A' as Requested_Loan_Amount
+                     , 'N/A' as Same_as_Cash_Code
+                     , NULL as Standard_Account_APR
+                     , NULL as Standard_Interest_Rate
+                     , NULL as Term_length_in_months
+                     , NULL  as Credit_Score_1
+                     , NULL as Credit_Score_1_pull_date
+                     , NULL as Credit_Score_1_Key_Factor_Reason_1
+                     , NULL as Credit_Score_1_Key_Factor_Reason_2
+                     , NULL as Credit_Score_1_Key_Factor_Reason_3
+                     , NULL as Credit_Score_1_Key_Factor_Reason_4
+                     , NULL as Credit_Score_1_Key_Factor_Reason_5
+            
+                     , 'N/A' as Credit_Score_2
+                     , 'N/A' as Credit_Score_2_pull_date
+                     , 'N/A' as Credit_Score_2_Key_Factor_Reason_1
+                     , 'N/A' as Credit_Score_2_Key_Factor_Reason_2
+                     , 'N/A' as Credit_Score_2_Key_Factor_Reason_3
+                     , 'N/A' as Credit_Score_2_Key_Factor_Reason_4
+                     , 'N/A' as Credit_Score_2_Key_Factor_Reason_5
+                     , 'N/A' as Credit_Score_3
+                     , 'N/A' as Credit_Score_3_pull_date
+                     , 'N/A' as Credit_Score_3_Key_Factor_Reason_1
+                     , 'N/A' as Credit_Score_3_Key_Factor_Reason_2
+                     , 'N/A' as Credit_Score_3_Key_Factor_Reason_3
+                     , 'N/A' as Credit_Score_3_Key_Factor_Reason_4
+                     , 'N/A' as Credit_Score_3_Key_Factor_Reason_5
+                     , NULL as Fraud_Score_1
+                     , NULL as Fraud_Score_2
+                     , 'N/A' as Fraud_Score_3
+                     , 'N/A' as Fraud_Score_4
+                     , 'N/A' as Fraud_Score_5
+                     , 'N/A' as Fraud_Score_6
+                     , 'N/A' as Fraud_Score_7
+                     , 'N/A' as Fraud_Score_8
+                     , 'N/A' as Fraud_Score_9
+                     , 'N/A' as Fraud_Score_10
+            FROM BASE
+            LEFT JOIN DC_GREEN
+            on base.consumer_uuid = dc_green.uuid
+            LEFT JOIN DC_RED
+            on dc_green.ID = dc_red.ID
+            JOIN AAN
+            on base.consumer_uuid=aan.consumer_uuid and base.order_token=aan.order_token and base.rejection_reason = aan.decline_reason
+            LEFT JOIN ap_raw_green.green.d_merchant merch
+            on base.merchant_id = merch.id 
+            
+            WHERE 1=1
+            and to_date(convert_timezone('UTC','America/Los_Angeles',base.event_info_event_time)) between (select start_dte from macro_variables) and (select end_dte from macro_variables)
+),
+
+APPLICATION_CRD AS -- base and starting point for this part is credit decisioning
+(
+        with BASE as
+        ( select * from
+                            (select order_token, 
+                            consumer_uuid,
+                            KEY_EVENT_INFO_ID,
+                            offers_loan_amount_amount,
+                            key_event_info_event_time,
+                            decision_status,
+                            merchant_id,
+                            offers_target_apr,
+                            offers_term, 
+                            offers_eligibility, 
+                            credit_report_uuid, 
+                            test_group, 
+                            decline_main_reason,
+                            decline_main_sub_reason,
+                            cast(convert_timezone('UTC','America/Los_Angeles',dateadd('MS',created_date,'1970-01-01')) as date) as created_time,            
+                            nullif(split_part(offers_term, '	', 1),'')::decimal(10,2) as term_1,
+                            nullif(split_part(offers_term, '	', 2),'')::decimal(10,2) as term_2,
+                            split_part(offers_eligibility, '	', 1) as elgb_1,
+                            split_part(offers_eligibility, '	', 2) as elgb_2,
+                            ROW_NUMBER()OVER(PARTITION BY  consumer_uuid, created_time, merchant_id, decline_main_reason ORDER BY  KEY_EVENT_INFO_EVENT_TIME desc) as rnk --dedupping based on rules used in MQF and advised by credit risk
+                         FROM AP_CUR_CRDRISK_G.CURATED_CREDIT_RISK_GREEN.consumer_lending_decision) 
+                         where rnk = 1
+                         and to_date(convert_timezone('UTC','America/Los_Angeles',key_event_info_event_time)) between (select start_dte from macro_variables) and (select end_dte from macro_variables)
+        ),
+                
+        
+             
+                 
+            DC_GREEN as
+                (select UUID,ID, suburb, state, postcode from AP_RAW_GREEN.GREEN.d_consumer where COUNTRY_CODE = 'US'), 
+           
+            
+        
+            DC_RED as
+                (select ID, given_names, surname, date_of_birth, ADDRESS1, ADDRESS2 from ap_raw_red_csmr.red.D_CONSUMER__okasperska_DSL3_SV), 
+         
+        
+            
+            BUREAU as
+            (
+                        select *
+                               from AP_CUR_CRRSKBR_G.PROD.RAW_R_E_CREDIT_CHECK_DETAILS where par_region = 'US'
+                               qualify 1= row_number() over (partition by key_credit_report_uuid order by event_info_event_time DESC)
+            ),
+            
+            
+                       
+            
+            
+        
+            IDV as --- UNION of two tables is required because of a currently investigated issue where some successful IDV records from checkout flow were not populated in INSTANT_IDV. This is currently under investigation and if fixed then only IDV1 part will be needed.
+    (with IDV1 as
+                (
+           
+                      select 
+                      b.order_token, 
+                      a.key_consumer_uuid consumer_uuid, 
+                      a.EVENT_INFO_EVENT_TIME,
+                      a.idv_check_result idv_check_result, 
+           (CASE WHEN (a.risk_indicators like '%04%' 
+                    OR a.risk_indicators like '%11%' 
+                    OR a.risk_indicators like '%12%' 
+                    OR a.risk_indicators like '%14%' 
+                    OR a.risk_indicators like '%25%' 
+                    OR a.risk_indicators like '%30%' 
+                    OR a.risk_indicators like '%40%' 
+                    OR a.risk_indicators like '%50%' 
+                    OR a.risk_indicators like '%PA%' 
+                    OR a.risk_indicators like '%PO%'
+                    OR a.risk_indicators like '%ZI%'
+                    OR a.risk_indicators like '%CA%'
+                    OR a.risk_indicators like '%CO%'
+                    OR a.risk_indicators like '%CZ%'
+                    OR a.risk_indicators like '%MO%'
+                    OR a.risk_indicators like '%SD%'
+                    OR a.risk_indicators like '%SR%'
+                    OR a.risk_indicators like '%VA%') then 'ADDRESS_ISSUE' 
+                  WHEN a.risk_indicators like  '%32%' then 'OFAC_ISSUE'
+                  ELSE NULL end) as rejection_reason 
+                      from AP_RAW_GREEN.GREEN.RAW_C_E_IDV_INSTANT_ID a
+                       join base b
+                       on a.key_consumer_uuid = b.consumer_uuid
+                       WHERE 1=1
+                       and cast(convert_timezone('UTC','America/Los_Angeles',a.EVENT_INFO_EVENT_TIME)as timestamp) <= cast(convert_timezone('UTC','America/Los_Angeles',b.key_event_info_event_time)as timestamp)
+                       
+            ),
+    IDV2 as 
+       (
+                    select 
+                    base.order_token, ---sometimes consumer gets verified on a different token, information is not fed to generic table and it causes misses therefore we need any verification from CL table
+                    consumer_consumer_uuid consumer_uuid,
+                    event_info_event_time,
+                    case when idvcl.result = 'VERIFIED' then 'TRUE' else 'FALSE' end as  idv_check_result,
+                    rejection_reason
+                    from ap_raw_green.green.RAW_C_E_CL_IDV_RESULT idvcl
+                    join base
+                    on base.consumer_uuid = idvcl.consumer_consumer_uuid -- this is only to get folks that had an attempt in credit risk so that we do not bring too much
+                    where par_region = 'US' 
+                    and idvcl.result = 'VERIFIED' ---only these are problematic here
+                    
+        ),
+        
+    IDV_UNIONED as
+
+(select * from IDV1 UNION select * from IDV2)
+
+select order_token, consumer_uuid, to_date(convert_timezone('UTC','America/Los_Angeles',EVENT_INFO_EVENT_TIME)) idv_date, idv_check_result, rejection_reason                   
+FROM (
+      select *, ROW_NUMBER () OVER(PARTITION BY  consumer_uuid, order_token ORDER BY  EVENT_INFO_EVENT_TIME desc) as rnk
+      from IDV_UNIONED)
+WHERE rnk = 1
+),
+        
+            
+            LOANS as
+                 (select token, loan_details_loan_id, consumer_consumer_uuid from
+                    (select token, loan_details_loan_id, consumer_consumer_uuid, row_number () over (partition by order_transaction_id order by event_info_event_time desc) as rnk
+                    from AP_RAW_GREEN.green.RAW_C_E_ORDER
+                    where payment_type = 'PCL'
+                    and status = 'APPROVED') 
+                    where rnk =1),
+                
+        
+             INVOICED as
+                     (SELECT order_token, amount, order_date
+                        FROM (SELECT
+                        a.id instalment_id, a.gdp_region, a.order_id, a.original_due_date, b.order_token, a.amount, b.order_date,
+                        row_number() over ( partition by a.order_id, a.gdp_region order by a.original_due_date asc )  as instalment_seq_id
+                        FROM ap_raw_green.green.f_instalment a
+                        JOIN ap_raw_green.green.f_order b
+                        ON a.order_id = b.id
+                        where b.country_code = 'US'
+                        and b.payment_type = 'PCL'
+                        order by 2,3,1)
+                WHERE instalment_seq_id = 2),
+        
+        
+                
+             XO as 
+                   (SELECT transaction_token, transaction_date, dropout_reason,uuid from AP_CUR_XOOP_G.PAY_MONTHLY.M_ATM_ATTEMPT_MASTER WHERE CUSTOMER_COUNTRY = 'US'),
+            
+        
+             
+           FSC1 as
+           (select * from 
+                (select order_token, consumer_id, var_value Fraud_Score_1, row_number() over (partition by CONSUMER_ID, order_token order by EVENT_INFO_EVENT_TIME desc) as rnk
+                --from AP_CUR_R_FEATSCI.CURATED_FEATURE_SCIENCE_RED.RAW_C_E_FC_DECISION_RECORD_RULE_VARS_RT__OKASPERSKA_DSL3_SV -- this table only has last 3 days
+                from AP_CUR_R_FEATSCI.CURATED_FEATURE_SCIENCE_RED.TBL_RAW_C_E_FC_DECISION_RECORD_RULE_VARS__OKASPERSKA_DSL3_SV
+                where par_region = 'US'
+                and checkpoint in ('CHECKOUT_CONFIRM')
+                and var_name in ('model_online_od_abusive_global_april_2024_score')
+                and par_process_date between (select start_dte from macro_variables) and (select end_dte from macro_variables)
+                )
+          where rnk = 1),
+        
+         FSC2 as
+         (select * from 
+                (select order_token, consumer_id, var_value Fraud_Score_2, row_number() over (partition by CONSUMER_ID, order_token order by EVENT_INFO_EVENT_TIME desc) as rnk
+                --from AP_CUR_R_FEATSCI.CURATED_FEATURE_SCIENCE_RED.RAW_C_E_FC_DECISION_RECORD_RULE_VARS_RT__OKASPERSKA_DSL3_SV
+                from AP_CUR_R_FEATSCI.CURATED_FEATURE_SCIENCE_RED.TBL_RAW_C_E_FC_DECISION_RECORD_RULE_VARS__OKASPERSKA_DSL3_SV
+                where par_region = 'US'
+                and checkpoint in ('CHECKOUT_CONFIRM')
+                and var_name in ('model_online_cb_model_global_june_2024_score')
+                and par_process_date between (select start_dte from macro_variables) and (select end_dte from macro_variables)
+                )
+         where rnk = 1)  
+        
+        -- FINAL_PASS as
+        select 'BLOCK' as Partner_ID
+               --  , base.order_token -- keep commented out in case needed for troubleshooting
+                 , concat(base.order_token,'__',base.KEY_EVENT_INFO_ID) as Application_ID -- concat added to make the application_id unique
+                 , loans.loan_details_loan_id as Loan_Account_Number
+                 , base.consumer_uuid as Customer_ID
+                 , dc_red.GIVEN_NAMES as First_Name
+                 , dc_red.SURNAME as Last_Name
+                 , 'WIP' as SSn_or_FedID
+                 , dc_red.DATE_OF_BIRTH as Date_of_Birth
+                 , dc_red.ADDRESS1 as Street_Address1
+                 , dc_red.ADDRESS2 as Street_Address2
+                 , dc_green.SUBURB as City
+                 , dc_green.STATE as State
+                 , cast(dc_green.POSTCODE as varchar) as Zipcode_plus_four            
+                 , 'N/A' as Ability_to_Pay_Measurement_Value
+                 , 'N/A' as Ability_to_Pay_Result
+                 , CASE WHEN bureau.experian_credit_check_details_is_active_military_duty = 'FALSE' THEN 'N' 
+                         when bureau.experian_credit_check_details_is_active_military_duty = 'TRUE' then 'Y' else null end  as Active_Duty_Flag
+                 , CASE WHEN idv.rejection_reason = 'ADDRESS_ISSUE' then 'Y' 
+                         WHEN  idv.rejection_reason <> 'ADDRESS_ISSUE' then 'N'  else NULL end as Address_Discrepancy_Alert       
+                 , aan.BATCH_DTTM as Adverse_Action_Notice_Date
+                 , aan.aan_1 as Adverse_Action_Reason_1
+                 , aan.aan_2 as Adverse_Action_Reason_2
+                 , aan.aan_3 as Adverse_Action_Reason_3
+                 , aan.aan_4 as Adverse_Action_Reason_4        
+                 , extract(year from to_date(convert_timezone('UTC','America/Los_Angeles',base.KEY_EVENT_INFO_EVENT_TIME))) - extract(year from dc_red.date_of_birth) as Applicant_age_at_time_of_application
+                 , (CASE WHEN base.decision_status ='APPROVED' THEN (split_part(base.offers_loan_amount_amount, '	', 1)) else null end) as Amount_Financed
+                 , to_date(convert_timezone('UTC','America/Los_Angeles',base.key_event_info_event_time)) as Application_Date 
+                 , to_date(convert_timezone('UTC','America/Los_Angeles',base.key_event_info_event_time)) as Application_Decision_Date
+                 , 'Point of Sale' as Application_Type
+                 , (CASE WHEN base.decision_status ='APPROVED' THEN (split_part(base.offers_loan_amount_amount, '	', 1)) else null end) as Approved_Loan_Amount_or_Initial_Credit_Limit
+                 , 'N/A' as Campaign_Name
+                 , (CASE WHEN idv.idv_check_result = 'TRUE' then 'N' when idv.idv_check_result = 'FALSE' then 'Y' else null end) as CIP_Match_Flag
+                 , (CASE WHEN base.credit_report_uuid is not null THEN 'Experian Premier Attributes' ELSE null END) as Credit_Reporting_Agency_Supplier
+                 , 'N/A' as Credit_Score_Exception_Notice_Date
+                 , (CASE WHEN base.decision_status ='APPROVED' THEN 'Y' Else Null END) as Customer_eConsent_Flag
+                 , 'N/A' as Customer_Requested_Decline_Reasons_Flag
+                 , 'N/A' as Date_Customer_Requested_Decline_Reasons        
+                 , to_date(convert_timezone('UTC','America/Los_Angeles',bureau.EVENT_INFO_EVENT_TIME)) as Date_of_Bureau_Inquiry
+                 , 'N/A' as Debt_to_Income_Ratio
+                 , CASE WHEN (base.decision_status ='DECLINED' and base.decline_main_sub_reason not in ('LIMIT_EXCEEDED','TOO_MANY_ORDERS','CREDIT_MODEL_DECLINE','CRITERIA_A_DECLINE_P13_ALL0400','CRITERIA_A_DECLINE_P13_ALL2184','CRITERIA_A_DECLINE_P13_ALL8220','CRITERIA_A_DECLINE_P13_COL8192','CRITERIA_A_DECLINE_P13_IQT9423','NO_ELIGIBLE_OFFER','VANTAGE_DECLINE','BANKRUPTCY_HIT','EXP_NO_HIT')) then 'APPLICATION DENIED'
+                 WHEN (base.decision_status ='DECLINED' and base.decline_main_sub_reason in ('LIMIT_EXCEEDED','TOO_MANY_ORDERS','CREDIT_MODEL_DECLINE','CRITERIA_A_DECLINE_P13_ALL0400','CRITERIA_A_DECLINE_P13_ALL2184','CRITERIA_A_DECLINE_P13_ALL8220','CRITERIA_A_DECLINE_P13_COL8192','CRITERIA_A_DECLINE_P13_IQT9423','NO_ELIGIBLE_OFFER','VANTAGE_DECLINE','BANKRUPTCY_HIT','EXP_NO_HIT')) then 'DENIED FOR INCOMPLETENESS'
+                        WHEN (base.decision_status = 'APPROVED' and loans.loan_details_loan_id is not null) then 'LOAN ORIGINATED'
+                        WHEN (base.decision_status = 'APPROVED' and loans.loan_details_loan_id is null) then 'APPLICATION APPROVED BUT NOT ACCEPTED'
+                        ELSE null END as  Disposition_of_Application
+                 , 'N/A' as Employment_Duration        
+                 ,(CASE WHEN bureau.EXPERIAN_CREDIT_CHECK_DETAILS_IS_FRAUD_ALERT_FOUND = 'FALSE' THEN 'N' 
+                        WHEN bureau.EXPERIAN_CREDIT_CHECK_DETAILS_IS_FRAUD_ALERT_FOUND = 'TRUE' THEN 'Y' ELSE null END ) as Fraud_Alert_Initial
+                 , (CASE WHEN bureau.EXPERIAN_CREDIT_CHECK_DETAILS_IS_EXTENDED_FRAUD_ALERT_FOUND = 'FALSE' THEN 'N' 
+                         WHEN bureau.EXPERIAN_CREDIT_CHECK_DETAILS_IS_EXTENDED_FRAUD_ALERT_FOUND = 'TRUE' THEN 'Y' ELSE null END) as Fraud_Alert_Extended        
+                 , 'N/A' as Income_of_Applicant
+                 , 'N/A' as Income_of_Joint_or_Co_Applicant
+                 ,'Fixed' as Interest_Rate_Method
+                 , 'N/A' as Name_of_Joint_or_Co_Applicant
+                 , 'English' Language_Flag        
+                 , (case when  xo.Dropout_Reason  in ('Risk - Fraud', 'Card Type rejection','Invalid Payment details','Payment error','Topaz Setup Error','Merchant Capture',
+                        'System error','No Dropoff') then xo.transaction_date else null end) as Loan_Acceptance_Date
+                 , 'N/A' as Marketing_Channel
+                 ,  merch.trading_name as Merchant
+                 , 'N/A' as MLA_Status
+                 , 'N/A' as MLA_Status_Indicator_Method        
+                 , 'N/A' as Non_CRA_third_party_reason_for_decline
+                 , 'N/A' Non_CRA_third_party_reason_for_decline2                
+                 , CASE WHEN idv.rejection_reason = 'OFAC_ISSUE' then 'Y' when idv.rejection_reason <> 'OFAC_ISSUE' THEN 'N' else NULL end as OFAC_Soft_Hit
+                 , idv.idv_date as OFAC_Check_Date        
+                 , 'N' as Firm_Offer_of_Credit
+                 , 'N/A' as Origination_Fee
+                 , invoiced.amount as Payment_Amount  
+                 , 'Monthly' as Payment_Frequency
+                 , 'N/A' as Payment_to_Income_Ratio        
+                 , 'N/A' as Pend_Reason
+                 , (CASE WHEN base.test_group = 'control' then 'N' when (base.test_group <> 'control' and base.test_group is not null) then 'Y' else null end) as POC_Flag
+                 , 'Apinstallment' as Product
+                 , 'N/A' as Promotional_Interest_Rate
+                 , 'N/A' as Promotional_Interest_Rate_Duration
+                 , 'N/A' as Requested_Loan_Amount
+                 , 'N/A' as Same_as_Cash_Code
+                 , nullif(split_part(base.offers_target_apr, '	', 1),'')::decimal(10,6) as Standard_Account_APR
+                 , nullif(split_part(base.offers_target_apr, '	', 1),'')::decimal(10,6) as Standard_Interest_Rate             
+                 , case when base.elgb_2 = 'true' then base.term_2 else base.term_1 end as Term_length_in_months        
+                 , nullif(bureau.experian_credit_check_details_vantage_score,'')::INTEGER  as Credit_Score_1
+                 , TO_DATE(convert_timezone('UTC','America/Los_Angeles',bureau.EVENT_INFO_EVENT_TIME)) as Credit_Score_1_pull_date
+                 , SPLIT_PART(bureau.EXPERIAN_CREDIT_CHECK_DETAILS_VANTAGE_SCORE_FACTORS_CODE_EXPLANATION, '	', 1) as Credit_Score_1_Key_Factor_Reason_1
+                 , SPLIT_PART(bureau.EXPERIAN_CREDIT_CHECK_DETAILS_VANTAGE_SCORE_FACTORS_CODE_EXPLANATION, '	', 2) as Credit_Score_1_Key_Factor_Reason_2
+                 , SPLIT_PART(bureau.EXPERIAN_CREDIT_CHECK_DETAILS_VANTAGE_SCORE_FACTORS_CODE_EXPLANATION, '	', 3) as Credit_Score_1_Key_Factor_Reason_3
+                 , SPLIT_PART(bureau.EXPERIAN_CREDIT_CHECK_DETAILS_VANTAGE_SCORE_FACTORS_CODE_EXPLANATION, '	', 4) as Credit_Score_1_Key_Factor_Reason_4
+                 , SPLIT_PART(bureau.EXPERIAN_CREDIT_CHECK_DETAILS_VANTAGE_SCORE_FACTORS_CODE_EXPLANATION, '	', 4) as Credit_Score_1_Key_Factor_Reason_5        
+                 , 'N/A' as Credit_Score_2
+                 , 'N/A' as Credit_Score_2_pull_date
+                 , 'N/A' as Credit_Score_2_Key_Factor_Reason_1
+                 , 'N/A' as Credit_Score_2_Key_Factor_Reason_2
+                 , 'N/A' as Credit_Score_2_Key_Factor_Reason_3
+                 , 'N/A' as Credit_Score_2_Key_Factor_Reason_4
+                 , 'N/A' as Credit_Score_2_Key_Factor_Reason_5
+                 , 'N/A' as Credit_Score_3
+                 , 'N/A' as Credit_Score_3_pull_date
+                 , 'N/A' as Credit_Score_3_Key_Factor_Reason_1
+                 , 'N/A' as Credit_Score_3_Key_Factor_Reason_2
+                 , 'N/A' as Credit_Score_3_Key_Factor_Reason_3
+                 , 'N/A' as Credit_Score_3_Key_Factor_Reason_4
+                 , 'N/A' as Credit_Score_3_Key_Factor_Reason_5
+                 , CASE WHEN base.decision_status = 'APPROVED' then round(fsc1.Fraud_Score_1,4) else null end as Fraud_Score_1
+                 , CASE WHEN base.decision_status = 'APPROVED' then round(fsc2.Fraud_Score_2,4) else null end as Fraud_Score_2
+                 , 'N/A' as Fraud_Score_3
+                 , 'N/A' as Fraud_Score_4
+                 , 'N/A' as Fraud_Score_5
+                 , 'N/A' as Fraud_Score_6
+                 , 'N/A' as Fraud_Score_7
+                 , 'N/A' as Fraud_Score_8
+                 , 'N/A' as Fraud_Score_9
+                 , 'N/A' as Fraud_Score_10
+        FROM BASE
+        LEFT JOIN DC_GREEN
+        on base.consumer_uuid = dc_green.uuid
+        LEFT JOIN DC_RED
+        on dc_green.ID = dc_red.ID
+        LEFT JOIN BUREAU
+        on base.credit_report_uuid=bureau.key_credit_report_uuid
+        JOIN AAN
+        on base.consumer_uuid=aan.consumer_uuid and base.order_token=aan.order_token and aan.decline_main_sub_reason = base.decline_main_sub_reason
+        LEFT JOIN IDV
+        on base.consumer_uuid = idv.consumer_uuid and base.order_token = idv.order_token
+        LEFT JOIN LOANS
+        on base.order_token = loans.token and base.consumer_uuid = loans.consumer_consumer_uuid and base.decision_status = 'APPROVED'
+        LEFT JOIN INVOICED
+        on base.order_token = invoiced.order_token and base.decision_status = 'APPROVED'
+        LEFT JOIN XO
+        on base.order_token = xo.transaction_token and base.consumer_uuid = xo.uuid and xo.transaction_date = to_date(convert_timezone('UTC','America/Los_Angeles',base.KEY_EVENT_INFO_EVENT_TIME))  and base.decision_status = 'APPROVED' 
+        LEFT JOIN FSC1
+        on base.order_token = fsc1.order_token and base.consumer_uuid = fsc1.consumer_id
+        LEFT JOIN FSC2
+        on base.order_token = fsc2.order_token and base.consumer_uuid = fsc2.consumer_id    
+        LEFT JOIN ap_raw_green.green.d_merchant merch
+        on base.merchant_id = merch.id 
+        
+        WHERE 1=1
+        and to_date(convert_timezone('UTC','America/Los_Angeles',base.key_event_info_event_time)) between (select start_dte from macro_variables) and (select end_dte from macro_variables)
+        --and base.order_token not in (select attempt_id from app_cash_3pr.afterpay.test_attempt_exclusions)
+)
+
+(select * from APPLICATION_IDV) Union (select * from APPLICATION_CRD)
