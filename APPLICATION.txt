@@ -6,8 +6,8 @@ CREATE OR REPLACE TABLE  PERSONAL_OKASPERSKA.public.EV_APPLICATION AS
 WITH macro_variables as 
 (
 SELECT
-    '2024-10-01'::DATE AS start_dte,
-    '2024-10-31'::DATE AS end_dte
+    '2024-11-01'::DATE AS start_dte,
+    '2024-11-30'::DATE AS end_dte
 ),
 
 
@@ -499,7 +499,7 @@ WHERE rnk = 1
                  , 'N/A' as MLA_Status_Indicator_Method        
                  , 'N/A' as Non_CRA_third_party_reason_for_decline
                  , 'N/A' Non_CRA_third_party_reason_for_decline2                
-                 , CASE WHEN idv.rejection_reason = 'OFAC_ISSUE' then 'Y' when idv.rejection_reason <> 'OFAC_ISSUE' THEN 'N' else NULL end as OFAC_Soft_Hit
+                 , CASE WHEN idv.rejection_reason = 'OFAC_ISSUE' then 'Y' ELSE 'N' end as OFAC_Soft_Hit
                  , idv.idv_date as OFAC_Check_Date        
                  , 'N' as Firm_Offer_of_Credit
                  , 'N/A' as Origination_Fee
@@ -575,7 +575,7 @@ WHERE rnk = 1
         
         WHERE 1=1
         and to_date(convert_timezone('UTC','America/Los_Angeles',base.key_event_info_event_time)) between (select start_dte from macro_variables) and (select end_dte from macro_variables)
-        --and base.order_token not in (select attempt_id from app_cash_3pr.afterpay.test_attempt_exclusions)
+        and base.order_token not in (select attempt_id from app_cash_3pr.afterpay.test_attempt_exclusions)
 )
 
 (select * from APPLICATION_IDV) Union (select * from APPLICATION_CRD)
