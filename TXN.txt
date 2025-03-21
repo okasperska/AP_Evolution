@@ -1,0 +1,187 @@
+USE database ap_Raw_green;
+USE WAREHOUSE ADHOC__XLARGE;
+CREATE OR REPLACE TABLE  PERSONAL_OKASPERSKA.public.EV_TRANSACTION AS
+
+(
+WITH macro_variables as
+(
+SELECT
+2024-11-01'::DATE AS start_dte,
+2024-11-30'::DATE AS end_dte
+),
+
+---- this dataset does not have a "BASE" - it covers all transactiona that happen in reporting month. Even repayment against charged off loans will be included
+
+INVOICED AS -- determines starting balance
+(
+select a.event_date,
+a.order_id,
+cast(a.order_id as varchar) transaction_id,
+INVOICED' as transaction_type,
+NULL as payment_method,
+sum(a.amount_invoiced) transaction_amount
+from ap_raw_green.green.f_instalment_events a
+join ap_raw_green.green.f_order b
+on a.order_id = b.id
+WHERE 1=1
+and b.payment_type = 'PCL'
+and b.country_code = 'US'
+and a.event_type IN ('INVOICED', 'OVERAGE')
+and a.event_date between (select start_dte from macro_variables) and (select end_dte from macro_variables)
+group by 1,2,3,4,5
+),
+
+INSTALMENT_SEQ AS -- needed to determine the downpayment
+
+(
+SELECT
+distinct a.id instalment_id,
+a.gdp_region,
+a.order_id,
+a.original_due_date,
+row_number() over ( partition by a.order_id, a.gdp_region order by a.original_due_date asc )  as instalment_seq_id
+FROM ap_raw_green.green.f_instalment a
+JOIN ap_raw_green.green.f_order b
+ON a.order_id = b.id
+WHERE b.payment_type = 'PCL'
+and b.country_code = 'US'
+and b.order_date between (select (start_dte - 30) from macro_variables) and (select end_dte from macro_variables)
+order by 2,3,1
+),
+
+PAYMENTS AS
+(
+select a.event_date,
+a.order_id,
+cast(concat(a.payment_id,'__',a.instalment_id) as varchar) transaction_id,
+CASE WHEN (e.instalment_seq_id = 1 and c.payment_source IN ('Charge at ship', 'BUY_PROCESS', 'POS', 'Buy process')) then 'DOWNPAYMENT'
+else 'PAYMENT' END as transaction_type,
+case when d.payment_method_type_id = 1 then concat(d.card_type,'_Card') else d.payment_method_type end as payment_method,
+sum(a.amount_paid) transaction_amount
+from ap_raw_green.green.f_instalment_events a
+join ap_raw_green.green.f_order b
+on a.order_id = b.id
+join ap_raw_green.green.f_payment c
+on a.payment_id =c.id and a.gdp_region = c.gdp_region
+JOIN ap_raw_green.green.d_payment_method d
+ON c.payment_method_id = d.id and c.gdp_region = d.gdp_region
+LEFT JOIN instalment_seq e
+ON
+WHERE 1=1
+and b.payment_type = 'PCL'
+and b.country_code = 'US'
+and a.event_type = 'PAYMENT'
+and a.event_date between (select start_dte from macro_variables) and (select end_dte from macro_variables)
+group by 1,2,3,4,5
+),
+
+REFUNDS_AP AS
+(
+select a.event_date,
+a.order_id,
+cast(concat(a.refund_id,'__',01) as varchar) transaction_id,
+REFUND_AFTER_PAYMENT' as transaction_type,
+NULL as payment_method,
+(-1)*sum(a.AMOUNT_REFUNDED_AFTER_PAYMENT) transaction_amount
+from ap_raw_green.green.f_instalment_events a
+join ap_raw_green.green.f_order b
+on a.order_id = b.id
+WHERE 1=1
+and b.payment_type = 'PCL'
+and b.country_code = 'US'
+and a.event_type = 'REFUNDED'
+and event_date between (select start_dte from macro_variables) and (select end_dte from macro_variables)
+group by 1,2,3,4,5
+having transaction_amount <0
+),
+
+REFUNDS_BP AS
+(
+select a.event_date,
+a.order_id,
+cast(concat(a.refund_id,'__',02) as varchar) transaction_id,
+REFUND_BEFORE_PAYMENT' as transaction_type,
+NULL as payment_method,
+(-1)*sum(a.AMOUNT_REFUNDED_BEFORE_PAYMENT) transaction_amount
+from ap_raw_green.green.f_instalment_events a
+join ap_raw_green.green.f_order b
+on a.order_id = b.id
+join ap_raw_green.green.f_refund c
+on a.refund_id = c.id and a.order_id = c.order_id
+WHERE 1=1
+and b.payment_type = 'PCL'
+and b.country_code = 'US'
+and a.event_type = 'REFUNDED'
+and c.refund_type <> 'InterestAccrual'
+and event_date between (select start_dte from macro_variables) and (select end_dte from macro_variables)
+group by 1,2,3,4,5
+having transaction_amount <0
+),
+
+INTEREST_ACCRUALS AS
+(
+select a.event_date,
+a.order_id,
+cast(concat(a.refund_id,'__',03) as varchar) transaction_id,
+INTEREST_ACCRUAL' as transaction_type,
+NULL as payment_method,
+sum(a.AMOUNT_REFUNDED_BEFORE_PAYMENT) transaction_amount
+from ap_raw_green.green.f_instalment_events a
+join ap_raw_green.green.f_order b
+on a.order_id = b.id
+join ap_raw_green.green.f_refund c
+on a.refund_id = c.id and a.order_id = c.order_id
+WHERE 1=1
+and b.payment_type = 'PCL'
+and b.country_code = 'US'
+and a.event_type = 'REFUNDED'
+and c.refund_type = 'InterestAccrual'
+and event_date between (select start_dte from macro_variables) and (select end_dte from macro_variables)
+group by 1,2,3,4,5
+having transaction_amount > 0
+),
+
+CONSOLIDATED AS
+
+( select * from
+((select * from PAYMENTS)
+UNION
+(SELECT * FROM REFUNDS_BP)
+UNION
+(SELECT * FROM REFUNDS_AP)
+UNION
+(SELECT * FROM INTEREST_ACCRUALS)
+UNION
+(SELECT * FROM INVOICED))
+where order_id not in (select order_id from app_cash_3pr.afterpay.test_order_exclusions)
+),
+
+MAPPING AS -- to get the loan id from loanservice
+(
+select loan_details_loan_id, order_transaction_id, token, consumer_consumer_uuid
+from
+(select loan_details_loan_id, order_transaction_id, token, consumer_consumer_uuid,  row_number () over (partition by order_transaction_id order by event_info_event_time desc) as rnk
+from AP_RAW_GREEN.green.RAW_C_E_ORDER
+where payment_type = 'PCL'
+and status = 'APPROVED')
+where rnk =1
+)
+
+SELECT
+Block' as Partner_ID,
+b.TOKEN as Application_ID,
+b.loan_details_loan_id as Loan_Account_Number,
+b.consumer_consumer_uuid as Customer_ID,
+a.transaction_id as Unique_Transaction_ID,
+CASE WHEN transaction_type = 'INVOICED' then 'Y' else 'N' END as First_Purchase_or_Cash_Advance_Flag,
+a.payment_method as Payment_Method,
+a.transaction_amount as Transaction_Amount,
+N/A' as Transaction_Code,
+a.event_date as Transaction_Date,
+N/A' as Transaction_Description,
+a.transaction_type as Transaction_Type
+from consolidated a
+join mapping b
+on a.order_id = b.order_transaction_id
+WHERE a.event_date between (select start_dte from macro_variables) and (select end_dte from macro_variables)
+)
