@@ -101,7 +101,7 @@ FRAUD_SCORE_7,
 FRAUD_SCORE_8,
 FRAUD_SCORE_9,
 FRAUD_SCORE_10
-from app_cash_3pr_pii.afterpay.feb_de_applications_daily limit 10
+from app_cash_3pr_pii.afterpay.feb_de_applications_daily
 
 
 --- TRANSACTIONS (Monthly feed) -- file name like block_afterpay_transaction_20250331_000000.csv
