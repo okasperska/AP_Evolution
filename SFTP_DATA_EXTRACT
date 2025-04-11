@@ -1,4 +1,4 @@
---- Application rememdiation -- file name like block_afterpay_application_20250401_000000.csv
+--- Application remediation -- file name like block_afterpay_application_20250401_000000.csv
 select 
 PARTNER_ID,
 APPLICATION_ID,
